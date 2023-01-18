@@ -1,0 +1,407 @@
+#include <stdio.h>
+#include <math.h>
+#include <sys/param.h>
+#include <unistd.h>
+#include <lwip/sockets.h>
+#include "lwip/err.h"
+#include "lwip/sys.h"
+#include <esp_flash_encrypt.h>
+#include "esp_netif.h"
+#include <esp_task_wdt.h>
+#include <esp_sntp.h>
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "sdkconfig.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "esp_wifi.h"
+#include "esp_log.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "sdkconfig.h"
+#include <string.h> 
+
+
+#include "ethernet_connect.h"
+#include "open62541.h"
+#include "DHT22.h"
+#include "model.h"
+#include "Potentiometer.h"
+#include "rc522.h"
+
+
+
+#include "soc/rtc_wdt.h"
+
+
+
+
+
+
+
+
+
+#define TAG "OPCUA_ESP32"
+#define SNTP_TAG "SNTP"
+#define MEMORY_TAG "MEMORY"
+#define ENABLE_MDNS 1
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/* The examples use WiFi configuration that you can set via project configuration menu
+
+   If you'd rather not, just change the below entries to strings with
+   the config you want - ie #define EXAMPLE_WIFI_SSID "mywifissid"
+*/
+#define EXAMPLE_ESP_WIFI_SSID      "XL4001-2.4GHz"
+#define EXAMPLE_ESP_WIFI_PASS      "ExtLab123"
+#define EXAMPLE_ESP_MAXIMUM_RETRY  400
+#define EXAMPLE_ESP_WIFI_CHANNEL   1
+#define EXAMPLE_MAX_STA_CONN       5
+
+
+
+
+
+
+static int s_retry_num = 0;
+
+
+/* FreeRTOS event group to signal when we are connected*/
+static EventGroupHandle_t s_wifi_event_group;
+
+/* The event group allows multiple bits for each event, but we only care about two events:
+ * - we are connected to the AP with an IP
+ * - we failed to connect after the maximum amount of retries */
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
+
+//static const char *TAG = "wifi station";
+
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+static void event_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data)
+{
+    rtc_wdt_feed();
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_retry_num < EXAMPLE_ESP_MAXIMUM_RETRY) {
+            esp_wifi_connect();
+            s_retry_num++;
+            ESP_LOGI(TAG, "retry to connect to the AP");
+        } else {
+            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        }
+        ESP_LOGI(TAG,"connect to the AP fail");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        s_retry_num = 0;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+
+static bool obtain_time(void);
+static void initialize_sntp(void);
+
+
+UA_ServerConfig *config;
+static UA_Boolean sntp_initialized = false;
+static UA_Boolean running = true;
+static UA_Boolean isServerCreated = false;
+RTC_DATA_ATTR static int boot_count = 0;
+static struct tm timeinfo;
+static time_t now = 0;
+
+
+
+static UA_StatusCode
+
+UA_ServerConfig_setUriName(UA_ServerConfig *uaServerConfig, const char *uri, const char *name)
+{
+    // delete pre-initialized values
+    UA_String_clear(&uaServerConfig->applicationDescription.applicationUri);
+    UA_LocalizedText_clear(&uaServerConfig->applicationDescription.applicationName);
+
+    uaServerConfig->applicationDescription.applicationUri = UA_String_fromChars(uri);
+    uaServerConfig->applicationDescription.applicationName.locale = UA_STRING_NULL;
+    uaServerConfig->applicationDescription.applicationName.text = UA_String_fromChars(name);
+
+    for (size_t i = 0; i < uaServerConfig->endpointsSize; i++)
+    {
+        UA_String_clear(&uaServerConfig->endpoints[i].server.applicationUri);
+        UA_LocalizedText_clear(
+            &uaServerConfig->endpoints[i].server.applicationName);
+
+        UA_String_copy(&uaServerConfig->applicationDescription.applicationUri,
+                       &uaServerConfig->endpoints[i].server.applicationUri);
+
+        UA_LocalizedText_copy(&uaServerConfig->applicationDescription.applicationName,
+                              &uaServerConfig->endpoints[i].server.applicationName);
+    }
+
+    return UA_STATUSCODE_GOOD;
+}
+
+static void opcua_task(void *arg)
+{
+    //BufferSize's got to be decreased due to latest refactorings in open62541 v1.2rc.
+    UA_Int32 sendBufferSize = 8192;
+    UA_Int32 recvBufferSize = 8192;
+
+    ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
+
+    ESP_LOGI(TAG, "Fire up OPC UA Server.");
+    UA_Server *server = UA_Server_new();
+    UA_ServerConfig *config = UA_Server_getConfig(server);
+    UA_ServerConfig_setMinimalCustomBuffer(config, 4840, 0, sendBufferSize, recvBufferSize);
+
+    const char *appUri = "open62541.esp32.server";
+    UA_String hostName = UA_STRING("opcua-esp32");
+#ifdef ENABLE_MDNS
+    config->mdnsEnabled = true;
+    config->mdnsConfig.mdnsServerName = UA_String_fromChars(appUri);
+    config->mdnsConfig.serverCapabilitiesSize = 2;
+    UA_String *caps = (UA_String *)UA_Array_new(2, &UA_TYPES[UA_TYPES_STRING]);
+    caps[0] = UA_String_fromChars("LDS");
+    caps[1] = UA_String_fromChars("NA");
+    config->mdnsConfig.serverCapabilities = caps;
+    // We need to set the default IP address for mDNS since internally it's not able to detect it.
+    tcpip_adapter_ip_info_t default_ip;
+    
+    #ifdef CONFIG_EXAMPLE_CONNECT_ETHERNET
+    tcpip_adapter_if_t tcpip_if = TCPIP_ADAPTER_IF_ETH;
+    #else
+    tcpip_adapter_if_t tcpip_if = TCPIP_ADAPTER_IF_STA;
+    #endif
+
+    esp_err_t ret = tcpip_adapter_get_ip_info(tcpip_if, &default_ip);
+    if ((ESP_OK == ret) && (default_ip.ip.addr != INADDR_ANY))
+    {
+        config->mdnsIpAddressListSize = 1;
+        config->mdnsIpAddressList = (uint32_t *)UA_malloc(sizeof(uint32_t) * config->mdnsIpAddressListSize);
+        memcpy(config->mdnsIpAddressList, &default_ip.ip.addr, sizeof(uint32_t));
+    }
+    else
+    {
+        ESP_LOGI(TAG, "Could not get default IP Address!");
+    }
+#endif
+    UA_ServerConfig_setUriName(config, appUri, "OPC_UA_Server_ESP32");
+    UA_ServerConfig_setCustomHostname(config, hostName);
+
+    /* Add Information Model Objects Here */ 
+
+
+    //______________________________________________________________________________________________________________
+    //______________________________________________________________________________________________________________
+    
+    addCurrentTemperatureDataSourceVariable(server);
+    addCurrentUmidadeDataSourceVariable(server);
+    addRFID(server);
+    addRFID2(server);
+    addRFIDFlag1ControlNode(server);
+    addRFIDFlag2ControlNode(server);
+    addCurrentVoltageDataSourceVariable(server);
+    addAirQuality(server);
+    RC522Init();
+    RC522Init_2();
+    
+    //______________________________________________________________________________________________________________
+    //______________________________________________________________________________________________________________
+
+    ESP_LOGI(TAG, "Heap Left : %d", xPortGetFreeHeapSize());
+    UA_StatusCode retval = UA_Server_run_startup(server);
+    if (retval == UA_STATUSCODE_GOOD)
+    {
+        while (running)
+        {   
+            
+    
+            UA_Server_run_iterate(server, false);
+            ESP_ERROR_CHECK(esp_task_wdt_reset());
+            taskYIELD();
+        }
+        UA_Server_run_shutdown(server);
+    }
+    ESP_ERROR_CHECK(esp_task_wdt_delete(NULL));
+}
+
+void time_sync_notification_cb(struct timeval *tv)
+{
+    ESP_LOGI(SNTP_TAG, "Notification of a time synchronization event");
+}
+
+static void initialize_sntp(void)
+{
+    ESP_LOGI(SNTP_TAG, "Initializing SNTP");
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, "pool.ntp.org");
+    sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+    sntp_init();
+    sntp_initialized = true;
+}
+
+static bool obtain_time(void)
+{
+    initialize_sntp();
+    ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
+    memset(&timeinfo, 0, sizeof(struct tm));
+    int retry = 0;
+    const int retry_count = 10;
+    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry <= retry_count)
+    {
+        ESP_LOGI(SNTP_TAG, "Waiting for system time to be set... (%d/%d)", retry, retry_count);
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+        ESP_ERROR_CHECK(esp_task_wdt_reset());
+    }
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    ESP_ERROR_CHECK(esp_task_wdt_delete(NULL));
+    return timeinfo.tm_year > (2016 - 1900);
+}
+
+
+static void opc_event_handler(void *arg, esp_event_base_t event_base,
+                              int32_t event_id, void *event_data)
+{
+    if (sntp_initialized != true)
+    {
+        if (timeinfo.tm_year < (2016 - 1900))
+        {
+            ESP_LOGI(SNTP_TAG, "Time is not set yet. Settting up network connection and getting time over NTP.");
+            if (!obtain_time())
+            {
+                ESP_LOGE(SNTP_TAG, "Could not get time from NTP. Using default timestamp.");
+            }
+            time(&now);
+        }
+        localtime_r(&now, &timeinfo);
+        ESP_LOGI(SNTP_TAG, "Current time: %d-%02d-%02d %02d:%02d:%02d", timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday, timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    }
+
+    if (!isServerCreated)
+    {
+        xTaskCreatePinnedToCore(opcua_task, "opcua_task", 23000, NULL, 8, NULL, 0);
+        ESP_LOGI(MEMORY_TAG, "Heap size after OPC UA Task : %d", esp_get_free_heap_size());
+        isServerCreated = true;
+        
+    }
+}
+
+
+static void disconnect_handler(void *arg, esp_event_base_t event_base,
+                              int32_t event_id, void *event_data)
+{
+
+}
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                                    int32_t event_id, void* event_data)
+{
+    if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
+        ESP_LOGI(TAG, "station "MACSTR" join, AID=%d",
+                 MAC2STR(event->mac), event->aid);
+
+                   
+    } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
+        ESP_LOGI(TAG, "station "MACSTR" leave, AID=%d",
+                 MAC2STR(event->mac), event->aid);
+    }
+}
+void wifi_init_sta(void)
+{
+    s_wifi_event_group = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    esp_netif_t *my_sta = esp_netif_create_default_wifi_sta();
+
+    esp_netif_dhcpc_stop(my_sta);
+
+    esp_netif_ip_info_t ip_info;
+
+    IP4_ADDR(&ip_info.ip, 192,168,160,5);//192, 168, 0, 5);
+   	IP4_ADDR(&ip_info.gw, 192,168,160,1);//192, 168, 0, 1);
+   	IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
+
+    esp_netif_set_ip_info(my_sta, &ip_info);
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &opc_event_handler, NULL));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = EXAMPLE_ESP_WIFI_SSID,
+            .password = EXAMPLE_ESP_WIFI_PASS
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
+    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config) );
+    ESP_ERROR_CHECK(esp_wifi_start() );
+
+    ESP_LOGI(TAG, "wifi_init_sta finished.");
+
+    /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
+     * number of re-tries (WIFI_FAIL_BIT). The bits are set by event_handler() (see above) */
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+            pdFALSE,
+            pdFALSE,
+            portMAX_DELAY);
+
+    /* xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
+     * happened. */
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
+                 EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
+    } else if (bits & WIFI_FAIL_BIT) {
+        ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
+                 EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
+    } else {
+        ESP_LOGE(TAG, "UNEXPECTED EVENT");
+    }
+
+    ESP_ERROR_CHECK(esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler));
+    ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler));
+    vEventGroupDelete(s_wifi_event_group);
+}
+
+
+
+void app_main(void)
+{   
+    ++boot_count;
+    //Workaround for CVE-2019-15894
+    //spi_flash_init();
+    if (esp_flash_encryption_enabled())
+    {
+        esp_flash_write_protect_crypt_cnt();
+    }
+
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES)
+    {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+    }
+
+    
+    //nome_rede = "Exsto Labtronix Restrita";
+    //senha_rede = "3xst0w!f!";
+    //wifi_init_softap();
+    //connection_scan();
+
+    wifi_init_sta();
+
+}
+

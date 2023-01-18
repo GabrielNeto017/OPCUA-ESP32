@@ -1,0 +1,5 @@
+{
+    "cmake.sourceDirectory": "${workspaceFolder}/opcua-esp32-master",
+    "idf.portWin": "COM4",
+    "C_Cpp.errorSquiggles": "enabled"
+}
